@@ -51,6 +51,45 @@ fn is_static_asset(path: &str) -> bool {
     )
 }
 
+/// Xtream Codes (IPTV) entry routes that authenticate themselves *inside* their
+/// handlers via `verify_xc_api_password`, which reads the api_password embedded in
+/// the base64 username (`base64({upstream}:{user}:{api_password})`).
+///
+/// Standard XC players (TiviMate, IPTV Smarters, UHF) can only send `username` +
+/// `password` — they cannot append `?api_password=` or a token. So the global
+/// middleware must let these routes through to their self-authenticating handlers,
+/// mirroring the Python `mediaflow-proxy`, which registers the XC router WITHOUT
+/// the global auth dependency. Auth is NOT bypassed: the handler still rejects a
+/// wrong/missing embedded password with 403.
+fn is_xtream_route(path: &str) -> bool {
+    const XC_EXACT: &[&str] = &["/player_api.php", "/xmltv.php", "/get.php", "/panel_api.php"];
+    if XC_EXACT.contains(&path) {
+        return true;
+    }
+    const XC_PREFIXES: &[&str] = &[
+        "/live/",
+        "/movie/",
+        "/series/",
+        "/timeshift/",
+        "/hls/",
+        "/hlsr/",
+    ];
+    if XC_PREFIXES.iter().any(|p| path.starts_with(p)) {
+        return true;
+    }
+    // Short-stream catch-all: /{username}/{password}/{stream_id}[.ext] — three
+    // non-empty segments whose first segment is not an internal scope prefix.
+    // The only handler matching this shape is short_stream_handler, which
+    // self-verifies, so exempting it opens no hole (non-XC paths 404).
+    let segments: Vec<&str> = path.trim_start_matches('/').split('/').collect();
+    segments.len() == 3
+        && !segments.iter().any(|s| s.is_empty())
+        && !matches!(
+            segments[0],
+            "proxy" | "extractor" | "playlist" | "speedtest" | "health" | "metrics"
+        )
+}
+
 #[derive(Clone)]
 pub struct AuthMiddleware {
     encryption_handler: Option<Arc<EncryptionHandler>>,
@@ -262,6 +301,17 @@ where
                     req.extensions_mut().insert(proxy_data);
                     return service.call(req).await;
                 }
+            }
+
+            // Xtream Codes routes self-authenticate in their handlers (the
+            // api_password is carried inside the base64 username, validated by
+            // verify_xc_api_password). XC players cannot send ?api_password or a
+            // token, so let these routes reach their handlers. ProxyData is still
+            // populated so any ReqData<ProxyData> extraction in a handler succeeds.
+            if is_xtream_route(req.path()) {
+                let proxy_data = build_proxy_data_from_query(&query_params);
+                req.extensions_mut().insert(proxy_data);
+                return service.call(req).await;
             }
 
             Err(AppError::Auth("Invalid or missing authentication".to_string()).into())
