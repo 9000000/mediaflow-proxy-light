@@ -665,6 +665,35 @@ impl Config {
             }
         }
 
+        // Python mediaflow-proxy compatibility: honour flat env vars when the
+        // structured APP__* equivalents are absent.  This lets users swap the
+        // Docker image without changing their environment.
+        let compat_pairs: &[(&str, &str)] = &[
+            ("API_PASSWORD", "auth.api_password"),
+            ("HOST", "server.host"),
+            ("PORT", "server.port"),
+            ("WORKERS", "server.workers"),
+            ("PROXY_URL", "proxy.proxy_url"),
+            ("ALL_PROXY", "proxy.all_proxy"),
+            ("TELEGRAM_API_ID", "telegram.api_id"),
+            ("TELEGRAM_API_HASH", "telegram.api_hash"),
+            ("TELEGRAM_SESSION_STRING", "telegram.session_string"),
+            ("TELEGRAM_MAX_CONNECTIONS", "telegram.max_connections"),
+            ("REDIS_URL", "redis.url"),
+            ("CACHE_NAMESPACE", "redis.cache_namespace"),
+            ("BYPARR_TIMEOUT", "extractor.byparr_timeout"),
+        ];
+        for (env_var, config_key) in compat_pairs {
+            if let Ok(val) = std::env::var(env_var) {
+                // Only apply when the APP__* equivalent is absent so the
+                // structured form always wins.
+                let app_key = format!("APP__{}", config_key.to_uppercase().replace('.', "__"));
+                if std::env::var(&app_key).is_err() {
+                    builder = builder.set_override(config_key, val)?;
+                }
+            }
+        }
+
         builder = builder.add_source(
             config::Environment::with_prefix("APP")
                 .separator("__")

@@ -62,7 +62,12 @@ fn is_static_asset(path: &str) -> bool {
 /// the global auth dependency. Auth is NOT bypassed: the handler still rejects a
 /// wrong/missing embedded password with 403.
 fn is_xtream_route(path: &str) -> bool {
-    const XC_EXACT: &[&str] = &["/player_api.php", "/xmltv.php", "/get.php", "/panel_api.php"];
+    const XC_EXACT: &[&str] = &[
+        "/player_api.php",
+        "/xmltv.php",
+        "/get.php",
+        "/panel_api.php",
+    ];
     if XC_EXACT.contains(&path) {
         return true;
     }

@@ -50,41 +50,112 @@ fn channel_cache() -> Arc<RwLock<HashMap<i64, i64>>> {
         .clone()
 }
 
-/// Scan the user's recent dialogs and populate the channel access_hash cache.
+/// Scan the user's dialogs and populate the channel access_hash cache.
+/// Paginates through all dialog pages until `target_channel_id` is found or
+/// all dialogs are exhausted (up to `MAX_PAGES * BATCH` entries).
 /// Returns the access_hash for `target_channel_id` if found, otherwise `None`.
 #[cfg(feature = "telegram")]
 async fn fetch_and_cache_channel_hashes(client: &Client, target_channel_id: i64) -> Option<i64> {
-    let result = client
-        .invoke(&tl::functions::messages::GetDialogs {
-            exclude_pinned: false,
-            folder_id: None,
-            offset_date: 0,
-            offset_id: 0,
-            offset_peer: tl::enums::InputPeer::Empty,
-            limit: 200,
-            hash: 0,
-        })
-        .await
-        .ok()?;
-
-    let chats: &[tl::enums::Chat] = match &result {
-        tl::enums::messages::Dialogs::Dialogs(d) => &d.chats,
-        tl::enums::messages::Dialogs::Slice(d) => &d.chats,
-        tl::enums::messages::Dialogs::NotModified(_) => return None,
-    };
+    const BATCH: i32 = 100;
+    const MAX_PAGES: usize = 30; // scan up to 3 000 dialogs
 
     let cache = channel_cache();
-    let mut write = cache.write().await;
     let mut found = None;
+    let mut offset_date = 0i32;
+    let mut offset_id = 0i32;
+    let mut offset_peer = tl::enums::InputPeer::Empty;
 
-    for chat in chats {
-        if let tl::enums::Chat::Channel(ch) = chat {
-            if let Some(hash) = ch.access_hash {
-                write.insert(ch.id, hash);
-                if ch.id == target_channel_id {
-                    found = Some(hash);
+    for _ in 0..MAX_PAGES {
+        let result = client
+            .invoke(&tl::functions::messages::GetDialogs {
+                exclude_pinned: false,
+                folder_id: None,
+                offset_date,
+                offset_id,
+                offset_peer: offset_peer.clone(),
+                limit: BATCH,
+                hash: 0,
+            })
+            .await
+            .ok()?;
+
+        // Extract everything we need while the borrow of `result` is live.
+        let (is_complete, batch_count, next_offset) = {
+            let (chats, dialogs, msgs, complete) = match &result {
+                tl::enums::messages::Dialogs::Dialogs(d) => {
+                    (&d.chats[..], &d.dialogs[..], &d.messages[..], true)
+                }
+                tl::enums::messages::Dialogs::Slice(d) => {
+                    (&d.chats[..], &d.dialogs[..], &d.messages[..], false)
+                }
+                tl::enums::messages::Dialogs::NotModified(_) => return found,
+            };
+
+            {
+                let mut w = cache.write().await;
+                for chat in chats {
+                    if let tl::enums::Chat::Channel(ch) = chat {
+                        if let Some(hash) = ch.access_hash {
+                            w.insert(ch.id, hash);
+                            if ch.id == target_channel_id {
+                                found = Some(hash);
+                            }
+                        }
+                    }
                 }
             }
+
+            // Find the last regular dialog for pagination offsets.
+            let last_info = dialogs.iter().rev().find_map(|d| {
+                if let tl::enums::Dialog::Dialog(dlg) = d {
+                    let date = msgs
+                        .iter()
+                        .find_map(|m| match m {
+                            tl::enums::Message::Message(msg) if msg.id == dlg.top_message => {
+                                Some(msg.date)
+                            }
+                            _ => None,
+                        })
+                        .unwrap_or(0);
+                    Some((dlg.top_message, date, dlg.peer.clone()))
+                } else {
+                    None
+                }
+            });
+
+            (complete, dialogs.len(), last_info)
+        };
+
+        if found.is_some() || is_complete || batch_count == 0 {
+            break;
+        }
+
+        let (last_top_msg, last_top_date, last_peer) = match next_offset {
+            Some(v) => v,
+            None => break,
+        };
+
+        offset_date = last_top_date;
+        offset_id = last_top_msg;
+        offset_peer = match last_peer {
+            tl::enums::Peer::User(p) => tl::enums::InputPeer::User(tl::types::InputPeerUser {
+                user_id: p.user_id,
+                access_hash: 0,
+            }),
+            tl::enums::Peer::Chat(p) => {
+                tl::enums::InputPeer::Chat(tl::types::InputPeerChat { chat_id: p.chat_id })
+            }
+            tl::enums::Peer::Channel(p) => {
+                let hash = cache.read().await.get(&p.channel_id).copied().unwrap_or(0);
+                tl::enums::InputPeer::Channel(tl::types::InputPeerChannel {
+                    channel_id: p.channel_id,
+                    access_hash: hash,
+                })
+            }
+        };
+
+        if batch_count < BATCH as usize {
+            break; // last page
         }
     }
 
